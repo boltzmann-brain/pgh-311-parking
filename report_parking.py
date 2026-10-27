@@ -32,51 +32,78 @@ from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sy
 SITE_URL = "https://pittsburghpa.my.site.com/311/s/"
 DEFAULT_CHROME_MAC = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 DEFAULT_PRESETS_PATH = Path(__file__).resolve().parent / "presets.json"
+DEFAULT_LOCAL_PRESETS_PATH = Path(__file__).resolve().parent / "presets.local.json"
 
 _SUBMIT_LOCK = threading.Lock()
 
 
-def load_config(path: Path = DEFAULT_PRESETS_PATH) -> dict[str, Any]:
-    default_cfg: dict[str, Any] = {
-        "contact": {
-            "first_name": None,
-            "last_name": None,
-            "email": None,
-            "phone": None,
-        },
-        "presets": {},
-    }
+def _read_raw_config(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        return default_cfg
+        return {"contact": {}, "presets": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
-            return default_cfg
-        contact = data.get("contact") if isinstance(data.get("contact"), dict) else {}
-        presets = data.get("presets") if isinstance(data.get("presets"), dict) else {}
+            return {"contact": {}, "presets": {}}
         return {
-            "contact": {
-                "first_name": contact.get("first_name") or None,
-                "last_name": contact.get("last_name") or None,
-                "email": contact.get("email") or None,
-                "phone": contact.get("phone") or None,
-            },
-            "presets": presets,
+            "contact": data.get("contact") if isinstance(data.get("contact"), dict) else {},
+            "presets": data.get("presets") if isinstance(data.get("presets"), dict) else {},
         }
     except Exception as exc:
         print(f"Warning: could not read config from {path}: {exc}", file=sys.stderr)
-        return default_cfg
+        return {"contact": {}, "presets": {}}
 
 
-def save_config(cfg: dict[str, Any], path: Path = DEFAULT_PRESETS_PATH) -> None:
+def get_local_presets_path(path: Path = DEFAULT_PRESETS_PATH) -> Path:
+    if path.resolve() == DEFAULT_PRESETS_PATH.resolve():
+        return DEFAULT_LOCAL_PRESETS_PATH
+    return path.with_name(f"{path.stem}.local{path.suffix}")
+
+
+def load_config(path: Path = DEFAULT_PRESETS_PATH) -> dict[str, Any]:
+    base = _read_raw_config(path)
+    local_path = get_local_presets_path(path)
+    local = _read_raw_config(local_path) if local_path != path else {"contact": {}, "presets": {}}
+
+    merged_contact: dict[str, Any] = {}
+    for k in ("first_name", "last_name", "email", "phone"):
+        val = local["contact"].get(k)
+        if not val:
+            val = base["contact"].get(k)
+        merged_contact[k] = val or None
+
+    merged_presets = dict(base["presets"])
+    merged_presets.update(local["presets"])
+    return {
+        "contact": merged_contact,
+        "presets": merged_presets,
+    }
+
+
+def save_contact_config(contact: dict[str, Any], path: Path = DEFAULT_PRESETS_PATH) -> Path:
+    """Save personal contact details to the gitignored presets.local.json file."""
+    local_path = get_local_presets_path(path)
+    local = _read_raw_config(local_path)
+    local["contact"] = {
+        "first_name": contact.get("first_name") or None,
+        "last_name": contact.get("last_name") or None,
+        "email": contact.get("email") or None,
+        "phone": contact.get("phone") or None,
+    }
+    local_path.write_text(json.dumps(local, indent=2) + "\n", encoding="utf-8")
+    return local_path
+
+
+def save_presets_config(presets: dict[str, Any], path: Path = DEFAULT_PRESETS_PATH) -> None:
+    """Save spot presets to presets.json while keeping presets.json contact fields redacted."""
+    base = _read_raw_config(path)
     out = {
-        "contact": cfg.get("contact") or {
-            "first_name": None,
-            "last_name": None,
-            "email": None,
-            "phone": None,
+        "contact": {
+            "first_name": base["contact"].get("first_name") or None,
+            "last_name": base["contact"].get("last_name") or None,
+            "email": base["contact"].get("email") or None,
+            "phone": base["contact"].get("phone") or None,
         },
-        "presets": cfg.get("presets") or {},
+        "presets": presets or {},
     }
     path.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
 
@@ -1089,15 +1116,14 @@ def run_web_server(
             parsed = urlparse(self.path)
             if parsed.path == "/api/contact":
                 data = self._read_json()
-                cfg = load_config(presets_path)
-                cfg["contact"] = {
+                contact_data = {
                     "first_name": (data.get("first_name") or "").strip() or None,
                     "last_name": (data.get("last_name") or "").strip() or None,
                     "email": (data.get("email") or "").strip() or None,
                     "phone": (data.get("phone") or "").strip() or None,
                 }
-                save_config(cfg, presets_path)
-                self._send_json({"status": "ok", "contact": cfg["contact"]})
+                save_contact_config(contact_data, presets_path)
+                self._send_json({"status": "ok", "contact": contact_data})
                 return
 
             if parsed.path == "/api/presets":
@@ -1127,7 +1153,7 @@ def run_web_server(
                     "additional_info": data.get("additional_info") or None,
                     "location_details": data.get("location_details") or None,
                 }
-                save_config(full_cfg, presets_path)
+                save_presets_config(presets, presets_path)
                 self._send_json({"status": "ok", "presets": presets})
                 return
 
@@ -1209,7 +1235,7 @@ def run_web_server(
                 presets = full_cfg["presets"]
                 if key in presets:
                     del presets[key]
-                    save_config(full_cfg, presets_path)
+                    save_presets_config(presets, presets_path)
                 self._send_json({"status": "ok", "presets": presets})
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -1422,26 +1448,28 @@ def main(argv: list[str] | None = None) -> int:
     contact_cfg = full_cfg["contact"]
 
     if args.clear_contact:
-        full_cfg["contact"] = {
-            "first_name": None,
-            "last_name": None,
-            "email": None,
-            "phone": None,
-        }
-        save_config(full_cfg, presets_path)
-        print(f"Cleared saved contact profile in {presets_path}.")
+        local_path = save_contact_config(
+            {
+                "first_name": None,
+                "last_name": None,
+                "email": None,
+                "phone": None,
+            },
+            presets_path,
+        )
+        print(f"Cleared saved contact profile in {local_path}.")
         return 0
 
     if args.save_contact:
-        full_cfg["contact"] = {
+        new_contact = {
             "first_name": args.first_name if args.first_name is not None else contact_cfg.get("first_name"),
             "last_name": args.last_name if args.last_name is not None else contact_cfg.get("last_name"),
             "email": args.email if args.email is not None else contact_cfg.get("email"),
             "phone": args.phone if args.phone is not None else contact_cfg.get("phone"),
         }
-        save_config(full_cfg, presets_path)
-        contact_cfg = full_cfg["contact"]
-        print(f"Saved default contact profile to {presets_path}:")
+        local_path = save_contact_config(new_contact, presets_path)
+        contact_cfg = new_contact
+        print(f"Saved default contact profile to {local_path} (gitignored):")
         print(f"  First Name : {contact_cfg.get('first_name') or '(none)'}")
         print(f"  Last Name  : {contact_cfg.get('last_name') or '(auto: Resident)'}")
         print(f"  Email      : {contact_cfg.get('email') or '(none)'}")
@@ -1454,7 +1482,8 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(full_cfg, indent=2))
         else:
             has_contact = any(contact_cfg.values())
-            print(f"Default Contact ({presets_path}):")
+            local_path = get_local_presets_path(presets_path)
+            print(f"Default Contact ({local_path}):")
             if has_contact:
                 print(
                     f"  Name: {contact_cfg.get('first_name') or ''} {contact_cfg.get('last_name') or '(auto: Resident)'}".strip()
@@ -1466,7 +1495,7 @@ def main(argv: list[str] | None = None) -> int:
             if not presets:
                 print("No presets saved.")
             else:
-                print("Saved Spot Presets:")
+                print(f"Saved Spot Presets ({presets_path}):")
                 for k, v in presets.items():
                     label = v.get("label") or k
                     print(f"  {k:<18} | {label} — {v.get('address')}")
@@ -1478,7 +1507,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: Preset '{args.delete_preset}' not found.", file=sys.stderr)
             return 1
         del presets[args.delete_preset]
-        save_config(full_cfg, presets_path)
+        save_presets_config(presets, presets_path)
         print(f"Deleted preset '{args.delete_preset}'.")
         return 0
 
@@ -1543,7 +1572,7 @@ def main(argv: list[str] | None = None) -> int:
             "additional_info": additional_info,
             "location_details": location_details,
         }
-        save_config(full_cfg, presets_path)
+        save_presets_config(presets, presets_path)
         print(f"Saved preset '{args.save_preset}' to {presets_path}.")
         if not args.preset and not args.dry_run:
             return 0

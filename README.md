@@ -63,7 +63,7 @@ Then open **http://127.0.0.1:8311** in your browser:
 
 ### Managing Presets & Default Contact Info from the CLI
 
-Presets and your optional default contact profile (Step 4 of 5) are stored in [`presets.json`](./presets.json).
+Spot presets are stored in [`presets.json`](./presets.json), while your personal contact profile (Step 4 of 5) is automatically saved to **`presets.local.json`** (which is gitignored so your name, email, and phone number are never committed to Git).
 *(Note: On PGH 311, if you provide an email or phone number, a Last Name is required by the form—if you don't specify `--last-name`, the script automatically fills `"Resident"`).*
 
 ```bash
