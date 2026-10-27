@@ -14,22 +14,37 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.cookiejar
 import json
+import mimetypes
 import os
 import re
 import sys
 import tempfile
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlencode, urlparse
 
 from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-SITE_URL = "https://pittsburghpa.my.site.com/311/s/"
+BASE_URL = "https://pittsburghpa.my.site.com"
+SITE_URL = f"{BASE_URL}/311/s/"
+VF_PAGE_URL = f"{BASE_URL}/311/Incap311CZ__esriMapVF"
+AURA_URL = f"{BASE_URL}/311/s/sfsites/aura"
+APEX_REMOTE_URL = f"{BASE_URL}/311/apexremote"
+SERVICE_CODE = "ILGLPARK"
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
+)
 DEFAULT_CHROME_MAC = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 DEFAULT_PRESETS_PATH = Path(__file__).resolve().parent / "presets.json"
 DEFAULT_LOCAL_PRESETS_PATH = Path(__file__).resolve().parent / "presets.local.json"
@@ -177,6 +192,590 @@ def normalize_phone_digits(phone: str) -> str:
             f"Phone number must contain 10 digits (got '{phone}'). Example: 412-555-1234"
         )
     return digits
+
+
+def format_phone_for_311(digits: str) -> str:
+    return f"+1 ({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
+
+
+def _json_compact(data: Any) -> str:
+    return json.dumps(data, separators=(",", ":"))
+
+
+def _extract_balanced_json(text: str, start: int) -> str:
+    if start < 0 or start >= len(text) or text[start] != "{":
+        raise ValueError("Could not locate JSON object in response")
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    raise ValueError("Unterminated JSON object in response")
+
+
+def _decode_aura_payload(raw: str) -> dict[str, Any]:
+    text = raw.strip()
+    if text.startswith("*/"):
+        text = text[2:]
+    if text.endswith("/*ERROR*/"):
+        text = text[: -len("/*ERROR*/")]
+    return json.loads(text)
+
+
+class Pgh311DirectClient:
+    """Small HTTP client for PGH 311's Salesforce Aura / Visualforce endpoints."""
+
+    def __init__(self) -> None:
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookie_jar)
+        )
+        self.request_counter = 0
+        self.aura_context: dict[str, Any] | None = None
+        self.vf_context: dict[str, Any] | None = None
+
+    def bootstrap(self) -> None:
+        html = self._get_text(SITE_URL)
+        context_match = re.search(r"sfsites/l/([^/]+)/resources\.js", html)
+        if not context_match:
+            raise RuntimeError("Could not extract Salesforce Aura bootstrap context")
+        raw_context = json.loads(unquote(context_match.group(1)))
+        self.aura_context = {
+            "mode": raw_context["mode"],
+            "fwuid": raw_context["fwuid"],
+            "app": raw_context["app"],
+            "loaded": raw_context["loaded"],
+            "dn": [],
+            "globals": {},
+            "uad": True,
+        }
+
+        vf_html = self._get_text(VF_PAGE_URL)
+        marker = "Visualforce.remoting.Manager.add(new $VFRM.RemotingProviderImpl("
+        marker_idx = vf_html.find(marker)
+        if marker_idx < 0:
+            raise RuntimeError("Could not extract Visualforce remoting context")
+        provider = json.loads(
+            _extract_balanced_json(vf_html, vf_html.find("{", marker_idx))
+        )
+        action = provider["actions"]["Incap311CZ.Base311CZ_JSOperationWrapper"]["ms"][0]
+        self.vf_context = {
+            "csrf": action["csrf"],
+            "vid": provider["vf"]["vid"],
+            "ns": action["ns"],
+            "ver": int(action["ver"]),
+            "authorization": action["authorization"],
+        }
+
+    def _get_text(self, url: str) -> str:
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        return self._open(request).read().decode("utf-8", errors="replace")
+
+    def _open(self, request: urllib.request.Request):
+        try:
+            return self.opener.open(request, timeout=30)
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(
+                f"HTTP {exc.code} from {request.full_url}: {body}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Could not reach {request.full_url}: {exc}") from exc
+
+    def _ensure_bootstrapped(self) -> None:
+        if not self.aura_context or not self.vf_context:
+            self.bootstrap()
+
+    def aura_remote(
+        self,
+        wrapper_method: str,
+        remote_method: str,
+        params: list[Any],
+    ) -> Any:
+        self._ensure_bootstrapped()
+        self.request_counter += 1
+        message = {
+            "actions": [
+                {
+                    "id": f"{self.request_counter};a",
+                    "descriptor": "aura://ApexActionController/ACTION$execute",
+                    "callingDescriptor": "UNKNOWN",
+                    "params": {
+                        "namespace": "Incap311CZ",
+                        "classname": "Base311CZ_Service_Wrapper",
+                        "method": wrapper_method,
+                        "params": {
+                            "method": remote_method,
+                            "params": _json_compact(params),
+                        },
+                        "cacheable": False,
+                        "isContinuation": False,
+                    },
+                }
+            ]
+        }
+        post_data = urlencode(
+            {
+                "message": _json_compact(message),
+                "aura.context": _json_compact(self.aura_context),
+                "aura.pageURI": "/311/s/",
+                "aura.token": "null",
+            }
+        ).encode("utf-8")
+        url = f"{AURA_URL}?r={self.request_counter}&aura.ApexAction.execute=1"
+        request = urllib.request.Request(
+            url,
+            data=post_data,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Origin": BASE_URL,
+                "Referer": SITE_URL,
+                "X-SFDC-LDS-Endpoints": (
+                    "ApexActionController.execute:Base311CZ_Service_Wrapper."
+                    f"{wrapper_method}"
+                ),
+            },
+        )
+        response = _decode_aura_payload(
+            self._open(request).read().decode("utf-8", errors="replace")
+        )
+        if "actions" not in response:
+            message_text = (
+                response.get("exceptionMessage")
+                or response.get("event", {}).get("attributes", {}).get("values", {}).get("message")
+                or str(response)[:500]
+            )
+            raise RuntimeError(f"Aura request failed: {message_text}")
+        action = response["actions"][0]
+        if action.get("state") != "SUCCESS":
+            errors = action.get("error") or []
+            message_text = "; ".join(
+                str(e.get("message") or e) for e in errors if isinstance(e, dict) or e
+            ) or str(errors)
+            raise RuntimeError(f"{remote_method} failed: {message_text}")
+        value = action.get("returnValue", {}).get("returnValue")
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
+
+    def vf_remote(self, remote_method: str, params: list[Any]) -> Any:
+        self._ensure_bootstrapped()
+        body = {
+            "action": "Incap311CZ.Base311CZ_JSOperationWrapper",
+            "method": "handleRemote",
+            "data": [remote_method, _json_compact(params)],
+            "type": "rpc",
+            "tid": 2,
+            "ctx": self.vf_context,
+        }
+        request = urllib.request.Request(
+            APEX_REMOTE_URL,
+            data=_json_compact(body).encode("utf-8"),
+            headers={
+                "User-Agent": USER_AGENT,
+                "Content-Type": "application/json",
+                "Origin": BASE_URL,
+                "Referer": VF_PAGE_URL,
+            },
+        )
+        response = json.loads(self._open(request).read().decode("utf-8"))
+        result = response[0] if isinstance(response, list) and response else response
+        if not isinstance(result, dict) or result.get("statusCode") != 200:
+            raise RuntimeError(f"Visualforce {remote_method} failed: {result}")
+        value = result.get("result")
+        return json.loads(value) if isinstance(value, str) else value
+
+    def fetch_addresses(self, address: str) -> list[dict[str, Any]]:
+        results = self.vf_remote(
+            "fetchAddress",
+            [
+                {
+                    "location_endpoint": None,
+                    "address_string": address,
+                    "magic_key": None,
+                    "language": "EN",
+                }
+            ],
+        )
+        if not isinstance(results, list):
+            raise RuntimeError(f"Unexpected address lookup response: {results}")
+        return results
+
+    def get_geolayers(self, address_record: dict[str, Any]) -> Any:
+        return self.aura_remote(
+            "handleRemote",
+            "getgeolayers",
+            [
+                {
+                    "location_endpoint": None,
+                    "lat": str(address_record["lat"]),
+                    "lng": str(address_record["long"]),
+                    "language": "EN",
+                    "additionalOpParams": address_record,
+                }
+            ],
+        )
+
+    def get_service_type(self) -> dict[str, Any]:
+        service = self.aura_remote(
+            "handleRemoteWithoutCache",
+            "getServiceTypeByCode",
+            [{"serviceCode": SERVICE_CODE, "for_status": False, "language": "EN"}],
+        )
+        if not isinstance(service, dict):
+            raise RuntimeError(f"Unexpected service configuration response: {service}")
+        return service
+
+    def get_file_upload_data(self) -> dict[str, Any]:
+        data = self.aura_remote("handleRemote", "getFileUploadData", [{}])
+        if not isinstance(data, dict):
+            raise RuntimeError(f"Unexpected file upload configuration response: {data}")
+        return data
+
+    def get_311_settings(self) -> dict[str, Any]:
+        settings = self.aura_remote("handleRemote", "get311Settings", [{}])
+        if not isinstance(settings, dict):
+            raise RuntimeError(f"Unexpected 311 settings response: {settings}")
+        return settings
+
+    def get_origin_ip(self, settings: dict[str, Any]) -> str | None:
+        if str(settings.get("Capture_IP") or "").lower() != "true":
+            return None
+        community_url = str(settings.get("Community_Url") or f"{BASE_URL}/311")
+        endpoint = community_url.replace("/s/", "/").rstrip("/") + (
+            "/services/apexrest/Incap311CZ/userip"
+        )
+        value = json.loads(self._get_text(endpoint))
+        return str(value) if value else None
+
+    def upload_photo(self, path: Path, upload_data: dict[str, Any]) -> str:
+        metadata = upload_data.get("custom_metadata") or {}
+        settings = metadata.get("FileLInk__Filelink_Setting__mdt") or []
+        endpoints = metadata.get("FileLInk__File_Upload_Setting__mdt") or []
+        endpoint = next(
+            (e for e in endpoints if e.get("FileLInk__Is_Default__c")),
+            endpoints[0] if endpoints else None,
+        )
+        if not endpoint:
+            raise RuntimeError("PGH 311 did not return a file upload endpoint")
+        api_key = endpoint.get("FileLInk__API_Key__c")
+        if not api_key and endpoint.get("FileLInk__Service_JSON__c"):
+            api_key = json.loads(endpoint["FileLInk__Service_JSON__c"]).get("API_Key__c")
+        upload_url = endpoint.get("FileLInk__URL__c")
+        if not api_key or not upload_url:
+            raise RuntimeError("PGH 311 returned incomplete file upload settings")
+
+        max_mb = 5.0
+        allowed_extensions: set[str] = set()
+        for row in settings:
+            name = row.get("DeveloperName")
+            value = str(row.get("FileLInk__Value__c") or "")
+            if name in {"Citizen_Portal_Max_File_Upload_Size", "Max_File_Upload_Size"}:
+                match = re.search(r"(\d+(?:\.\d+)?)\s*MB", value, re.IGNORECASE)
+                if match:
+                    max_mb = float(match.group(1))
+            elif name in {
+                "Citizen_Portal_Allowed_File_Extensions",
+                "Allowed_File_Extensions",
+            }:
+                allowed_extensions.update(
+                    ext.strip().lower() for ext in value.split(",") if ext.strip()
+                )
+
+        file_size = path.stat().st_size
+        if file_size > int(max_mb * 1024 * 1024):
+            raise ValueError(f"Photo exceeds PGH 311's {max_mb:g} MB limit: {path}")
+        extension = path.suffix.lstrip(".").lower()
+        if allowed_extensions and extension not in allowed_extensions:
+            allowed = ", ".join(sorted(allowed_extensions))
+            raise ValueError(f"File type '.{extension}' is not allowed by PGH 311 ({allowed})")
+
+        boundary = f"----pgh311-{uuid.uuid4().hex}"
+        filename = path.name
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="api_key"\r\n\r\n'
+            f"{api_key}\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="cFile"; filename="{filename}"\r\n'
+            f"Content-Type: {mime_type}\r\n\r\n"
+        ).encode("utf-8") + path.read_bytes() + f"\r\n--{boundary}--\r\n".encode("utf-8")
+        request = urllib.request.Request(
+            upload_url,
+            data=body,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Origin": BASE_URL,
+                "Referer": SITE_URL,
+            },
+        )
+        response = json.loads(self._open(request).read().decode("utf-8"))
+        public_url = response.get("public_url")
+        if not public_url:
+            raise RuntimeError(f"PGH 311 photo upload did not return a public URL: {response}")
+        return public_url
+
+    def create_service_request(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        result = self.aura_remote(
+            "handleRemoteWithoutCache", "createServiceRequest", [state]
+        )
+        if result == "QueryException":
+            result = self.aura_remote(
+                "handleRemoteWithoutCache", "createServiceRequestNew", [state]
+            )
+        if isinstance(result, str):
+            result = json.loads(result)
+        if not isinstance(result, list):
+            raise RuntimeError(f"Unexpected service request response: {result}")
+        return result
+
+
+def _metadata_value(settings: list[dict[str, Any]], name: str) -> str | None:
+    for row in settings:
+        if row.get("DeveloperName") == name:
+            value = row.get("FileLInk__Value__c")
+            return str(value) if value is not None else None
+    return None
+
+
+def _build_direct_service_request_state(
+    service_code: str,
+    address_record: dict[str, Any],
+    attributes: dict[str, str],
+    media_urls: list[str],
+    additional_info: str | None,
+    location_details: str | None,
+    contact: dict[str, str],
+    origin_ip: str | None,
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        "attribute": attributes,
+        "service_code": service_code,
+        "language": "EN",
+        "reported_lat": float(address_record["lat"]),
+        "reported_lng": float(address_record["long"]),
+        "address_string": address_record["address"],
+        "Dynamic_Questions": [],
+        "contact": contact,
+        "user_consent": False,
+        "consent_message": "",
+    }
+    if origin_ip:
+        state["origin_ip"] = origin_ip
+    if media_urls:
+        state["media_url"] = media_urls
+    if location_details:
+        state["address_details"] = location_details
+    if additional_info:
+        state["description"] = additional_info
+    return state
+
+
+def submit_parking_report_direct(
+    address: str,
+    description: str,
+    photo_paths: list[str] | None = None,
+    report_type: str = "Illegal Parking",
+    day_of_week: str = "N/A",
+    time_of_day: str = "N/A",
+    has_plate: str = "Unsure",
+    plate_number: str | None = None,
+    vehicle_description: str = "N/A",
+    duration: str = "N/A",
+    additional_info: str | None = None,
+    location_details: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
+    dry_run: bool = False,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    def log(msg: str) -> None:
+        if verbose:
+            print(msg, file=sys.stderr)
+
+    validated_photos: list[Path] = []
+    if photo_paths:
+        for p in photo_paths:
+            path_obj = Path(p).expanduser().resolve()
+            if not path_obj.is_file():
+                raise FileNotFoundError(f"Photo file not found: {p}")
+            validated_photos.append(path_obj)
+
+    if plate_number and has_plate == "Unsure":
+        has_plate = "Yes"
+
+    has_any_contact = any([first_name, last_name, email, phone])
+    effective_last_name = last_name or ("Resident" if has_any_contact else None)
+    clean_phone = normalize_phone_digits(phone) if phone else None
+    direct_contact: dict[str, str] = {}
+    if first_name:
+        direct_contact["first_name"] = first_name
+    if effective_last_name:
+        direct_contact["last_name"] = effective_last_name
+    if email:
+        direct_contact["email"] = email
+    if clean_phone:
+        direct_contact["phone"] = format_phone_for_311(clean_phone)
+
+    with _SUBMIT_LOCK:
+        client = Pgh311DirectClient()
+        log("[1/5] Bootstrapping PGH 311 direct session...")
+        client.bootstrap()
+
+        log("[2/5] Loading Illegal Parking service configuration...")
+        service_config = client.get_service_type()
+        pgh_settings = client.get_311_settings()
+        origin_ip = client.get_origin_ip(pgh_settings)
+        service_attributes = service_config.get("attributes") or []
+        report_type_attr = next(
+            (a for a in service_attributes if a.get("code") == "01PL-ILGLPRKTYP"),
+            {},
+        )
+        valid_report_types = [v.get("key") for v in report_type_attr.get("values") or []]
+        if valid_report_types and report_type not in valid_report_types:
+            raise ValueError(
+                f"Invalid report type '{report_type}'. Valid values: {', '.join(valid_report_types)}"
+            )
+
+        log(f"[3/5] Resolving Pittsburgh address '{address}'...")
+        address_records = client.fetch_addresses(address)
+        if not address_records:
+            raise RuntimeError(f"No matching Pittsburgh address found for '{address}'.")
+        address_candidates = [r for r in address_records if r.get("address")]
+        suggestions_text = [str(r["address"]).strip() for r in address_candidates]
+        if not suggestions_text:
+            raise RuntimeError(f"No matching Pittsburgh address found for '{address}'.")
+        chosen_idx = choose_best_address_suggestion(suggestions_text, address)
+        address_record = address_candidates[chosen_idx]
+        chosen_address = str(address_record["address"])
+        log(f"      Matched address: {chosen_address}")
+        geolayers = client.get_geolayers(address_record)
+
+        media_urls: list[str] = []
+        if validated_photos:
+            log(f"[4/5] Uploading {len(validated_photos)} attachment(s)...")
+            upload_data = client.get_file_upload_data()
+            upload_settings = (upload_data.get("custom_metadata") or {}).get(
+                "FileLInk__Filelink_Setting__mdt", []
+            )
+            portal_limit_text = _metadata_value(
+                upload_settings, "Citizen_Portal_Max_File_Upload_Number"
+            )
+            try:
+                portal_limit = int(portal_limit_text) if portal_limit_text else 6
+            except ValueError:
+                portal_limit = 6
+            if len(validated_photos) > portal_limit:
+                raise ValueError(
+                    f"PGH 311 allows at most {portal_limit} attachments via the citizen portal."
+                )
+            for photo in validated_photos:
+                media_urls.append(client.upload_photo(photo, upload_data))
+            log("      Upload complete.")
+        else:
+            log("[4/5] No attachments to upload.")
+
+        attributes = {
+            "01PL-ILGLPRKTYP": report_type,
+            "01TA-ILGLPRKDES": description,
+            "01TX-NOISEDAY": day_of_week,
+            "01TX-NOISETIME": time_of_day,
+            "01PL-ILGLPRKPLT": has_plate,
+            "01TA-ILGLPRKVEH": vehicle_description,
+            "01TX-ILGLPRKDUR": duration,
+        }
+        if has_plate == "Yes":
+            attributes["01TX-ILGLPRKNUM"] = plate_number or "N/A"
+
+        state = _build_direct_service_request_state(
+            SERVICE_CODE,
+            address_record,
+            attributes,
+            media_urls,
+            additional_info,
+            location_details,
+            direct_contact,
+            origin_ip,
+        )
+        result: dict[str, Any] = {
+            "status": "dry_run" if dry_run else "submitting",
+            "mode": "direct",
+            "matched_address": chosen_address,
+            "description": description,
+            "report_type": report_type,
+            "photos_uploaded": [p.name for p in validated_photos],
+            "contact": {
+                "first_name": first_name,
+                "last_name": effective_last_name,
+                "email": email,
+                "phone": clean_phone,
+            }
+            if has_any_contact
+            else None,
+            "request_payload": state,
+        }
+        if isinstance(geolayers, list) and geolayers:
+            result["geo_layers"] = {
+                str(layer.get("layerName")): layer.get("value")
+                for layer in geolayers
+                if isinstance(layer, dict) and layer.get("layerName")
+            }
+
+        if dry_run:
+            log("[5/5] Dry-run enabled: request built and validated without submitting.")
+            return result
+
+        log("[5/5] Submitting service request...")
+        created = client.create_service_request(state)
+        if not created or not isinstance(created[0], dict) or not created[0].get("id"):
+            raise RuntimeError(f"Service request submission failed on server: {created}")
+        confirmation = created[0]
+        result.update(
+            {
+                "status": "submitted",
+                "service_request_id": confirmation.get("service_request_id"),
+                "expected_resolution_date": confirmation.get("expected_datetime"),
+                "confirmation_text": json.dumps(confirmation, indent=2),
+                "case_details": {
+                    k: confirmation.get(k)
+                    for k in (
+                        "id",
+                        "service_request_id",
+                        "status",
+                        "service_name",
+                        "address_string",
+                        "requested_datetime",
+                        "expected_datetime",
+                    )
+                    if k in confirmation
+                },
+            }
+        )
+        log(f"      Success! Confirmation ID: {result['service_request_id']}")
+        return result
 
 
 def submit_parking_report(
@@ -397,6 +996,7 @@ def submit_parking_report(
 
                 result: dict[str, Any] = {
                     "status": "dry_run" if dry_run else "submitting",
+                    "mode": "browser",
                     "matched_address": chosen_address,
                     "description": description,
                     "report_type": report_type,
@@ -745,9 +1345,13 @@ WEB_UI_HTML = """<!DOCTYPE html>
   </header>
 
   <div class="controls-bar">
-    <label title="Run through all 5 steps and stop on Review without submitting">
+    <label title="Build and validate the request without submitting it to PGH 311">
       <input type="checkbox" id="dryRunToggle" />
       Dry-run mode (test without submitting)
+    </label>
+    <label title="Use the slower Playwright/Chrome browser workflow instead of direct HTTP">
+      <input type="checkbox" id="browserModeToggle" />
+      Browser fallback
     </label>
     <div class="file-picker">
       <label for="photoInput">Optional Photo:</label>
@@ -954,8 +1558,9 @@ function renderPresets() {
 async function triggerReport(payload) {
   if (isBusy) return;
   const dryRun = document.getElementById('dryRunToggle').checked;
+  const useBrowser = document.getElementById('browserModeToggle').checked;
   const photo = await readSelectedPhoto();
-  const body = { ...payload, dry_run: dryRun };
+  const body = { ...payload, dry_run: dryRun, use_browser: useBrowser };
   if (photo) body.photo = photo;
 
   setBusy(true);
@@ -963,7 +1568,9 @@ async function triggerReport(payload) {
   setStatus(
     '',
     `<span class="spinner"></span> Submitting PGH 311 report for "${targetName}"...`,
-    'Launching headless Chrome, matching GIS address, and filling steps 1-5 (~20-30s)...'
+    useBrowser
+      ? 'Launching headless Chrome, matching GIS address, and filling steps 1-5 (~20-30s)...'
+      : 'Calling PGH 311 backend endpoints directly—no browser or map tiles (~1-3s)...'
   );
 
   try {
@@ -1188,27 +1795,30 @@ def run_web_server(
                             f.write(raw_bytes)
                         photo_paths.append(temp_photo_path)
 
-                    res = submit_parking_report(
-                        address=cfg["address"],
-                        description=cfg["description"],
-                        photo_paths=photo_paths,
-                        report_type=cfg.get("report_type") or "Illegal Parking",
-                        day_of_week=cfg.get("day") or "N/A",
-                        time_of_day=cfg.get("time") or "N/A",
-                        has_plate=cfg.get("has_plate") or "Unsure",
-                        plate_number=cfg.get("plate"),
-                        vehicle_description=cfg.get("vehicle") or "N/A",
-                        duration=cfg.get("duration") or "N/A",
-                        additional_info=cfg.get("additional_info"),
-                        location_details=cfg.get("location_details"),
-                        first_name=cfg.get("first_name") or contact_cfg.get("first_name"),
-                        last_name=cfg.get("last_name") or contact_cfg.get("last_name"),
-                        email=cfg.get("email") or contact_cfg.get("email"),
-                        phone=cfg.get("phone") or contact_cfg.get("phone"),
-                        headless=True,
-                        dry_run=bool(data.get("dry_run", False)),
-                        verbose=True,
-                    )
+                    report_kwargs = {
+                        "address": cfg["address"],
+                        "description": cfg["description"],
+                        "photo_paths": photo_paths,
+                        "report_type": cfg.get("report_type") or "Illegal Parking",
+                        "day_of_week": cfg.get("day") or "N/A",
+                        "time_of_day": cfg.get("time") or "N/A",
+                        "has_plate": cfg.get("has_plate") or "Unsure",
+                        "plate_number": cfg.get("plate"),
+                        "vehicle_description": cfg.get("vehicle") or "N/A",
+                        "duration": cfg.get("duration") or "N/A",
+                        "additional_info": cfg.get("additional_info"),
+                        "location_details": cfg.get("location_details"),
+                        "first_name": cfg.get("first_name") or contact_cfg.get("first_name"),
+                        "last_name": cfg.get("last_name") or contact_cfg.get("last_name"),
+                        "email": cfg.get("email") or contact_cfg.get("email"),
+                        "phone": cfg.get("phone") or contact_cfg.get("phone"),
+                        "dry_run": bool(data.get("dry_run", False)),
+                        "verbose": True,
+                    }
+                    if data.get("use_browser"):
+                        res = submit_parking_report(**report_kwargs, headless=True)
+                    else:
+                        res = submit_parking_report_direct(**report_kwargs)
                     self._send_json(res)
                 except Exception as exc:
                     self._send_json(
@@ -1299,12 +1909,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--save-contact",
         action="store_true",
-        help="Save --email, --phone, --first-name, --last-name as the default contact profile in presets.json.",
+        help="Save --email, --phone, --first-name, --last-name as the default contact profile in presets.local.json.",
     )
     parser.add_argument(
         "--clear-contact",
         action="store_true",
-        help="Clear the saved default contact profile in presets.json (revert to anonymous).",
+        help="Clear the saved default contact profile in presets.local.json (revert to anonymous).",
     )
     parser.add_argument(
         "--anonymous",
@@ -1410,17 +2020,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Fill out all steps through the final Review screen without clicking Submit.",
+        help="Build and validate the report without submitting it to PGH 311.",
+    )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="Use the slower Playwright/Chrome workflow instead of direct HTTP.",
     )
     parser.add_argument(
         "--headed",
         action="store_true",
-        help="Run browser in visible (non-headless) mode.",
+        help="Run browser in visible (non-headless) mode (implies --browser).",
     )
     parser.add_argument(
         "--screenshot",
         default=None,
-        help="Optional file path to save a screenshot of the final Review or Confirmation screen.",
+        help="Optional browser-mode screenshot path (implies --browser).",
     )
     parser.add_argument(
         "--json",
@@ -1584,29 +2199,36 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    report_kwargs = {
+        "address": address,
+        "description": description,
+        "photo_paths": args.photos,
+        "report_type": report_type,
+        "day_of_week": day,
+        "time_of_day": time_of_day,
+        "has_plate": has_plate,
+        "plate_number": plate,
+        "vehicle_description": vehicle,
+        "duration": duration,
+        "additional_info": additional_info,
+        "location_details": location_details,
+        "first_name": first_name,
+        "last_name": last_name,
+        "email": email,
+        "phone": phone,
+        "dry_run": args.dry_run,
+        "verbose": not args.quiet,
+    }
+    use_browser = args.browser or args.headed or bool(args.screenshot)
     try:
-        res = submit_parking_report(
-            address=address,
-            description=description,
-            photo_paths=args.photos,
-            report_type=report_type,
-            day_of_week=day,
-            time_of_day=time_of_day,
-            has_plate=has_plate,
-            plate_number=plate,
-            vehicle_description=vehicle,
-            duration=duration,
-            additional_info=additional_info,
-            location_details=location_details,
-            first_name=first_name,
-            last_name=last_name,
-            email=email,
-            phone=phone,
-            headless=not args.headed,
-            dry_run=args.dry_run,
-            screenshot_path=args.screenshot,
-            verbose=not args.quiet,
-        )
+        if use_browser:
+            res = submit_parking_report(
+                **report_kwargs,
+                headless=not args.headed,
+                screenshot_path=args.screenshot,
+            )
+        else:
+            res = submit_parking_report_direct(**report_kwargs)
     except Exception as exc:
         if args.json:
             print(json.dumps({"status": "error", "error": str(exc)}, indent=2))
