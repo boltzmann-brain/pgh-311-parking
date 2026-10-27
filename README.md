@@ -1,4 +1,4 @@
-# 311-parking
+# pgh-311-parking
 
 Automated CLI and local one-click Web UI for reporting illegal parking to [Pittsburgh 311](https://pittsburghpa.my.site.com/311/s/).
 
