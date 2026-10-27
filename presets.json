@@ -1,0 +1,32 @@
+{
+  "presets": {
+    "grant-sidewalk": {
+      "label": "Grant St Sidewalk",
+      "address": "414 Grant St",
+      "description": "Vehicles parked blocking the sidewalk.",
+      "report_type": "Illegal Parking",
+      "day": "N/A",
+      "time": "N/A",
+      "has_plate": "Unsure",
+      "plate": null,
+      "vehicle": "N/A",
+      "duration": "N/A",
+      "additional_info": null,
+      "location_details": null
+    },
+    "forbes-bikelane": {
+      "label": "Forbes Ave Bike Lane",
+      "address": "1000 Forbes Ave",
+      "description": "Vehicles chronically parked in the protected bike lane.",
+      "report_type": "Illegal Parking",
+      "day": "N/A",
+      "time": "N/A",
+      "has_plate": "Unsure",
+      "plate": null,
+      "vehicle": "N/A",
+      "duration": "N/A",
+      "additional_info": null,
+      "location_details": null
+    }
+  }
+}
