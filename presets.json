@@ -1,4 +1,10 @@
 {
+  "contact": {
+    "first_name": null,
+    "last_name": null,
+    "email": null,
+    "phone": null
+  },
   "presets": {
     "grant-sidewalk": {
       "label": "Grant St Sidewalk",

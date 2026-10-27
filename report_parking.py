@@ -36,20 +36,49 @@ DEFAULT_PRESETS_PATH = Path(__file__).resolve().parent / "presets.json"
 _SUBMIT_LOCK = threading.Lock()
 
 
-def load_presets(path: Path = DEFAULT_PRESETS_PATH) -> dict[str, dict[str, Any]]:
+def load_config(path: Path = DEFAULT_PRESETS_PATH) -> dict[str, Any]:
+    default_cfg: dict[str, Any] = {
+        "contact": {
+            "first_name": None,
+            "last_name": None,
+            "email": None,
+            "phone": None,
+        },
+        "presets": {},
+    }
     if not path.is_file():
-        return {}
+        return default_cfg
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        presets = data.get("presets", data)
-        return presets if isinstance(presets, dict) else {}
+        if not isinstance(data, dict):
+            return default_cfg
+        contact = data.get("contact") if isinstance(data.get("contact"), dict) else {}
+        presets = data.get("presets") if isinstance(data.get("presets"), dict) else {}
+        return {
+            "contact": {
+                "first_name": contact.get("first_name") or None,
+                "last_name": contact.get("last_name") or None,
+                "email": contact.get("email") or None,
+                "phone": contact.get("phone") or None,
+            },
+            "presets": presets,
+        }
     except Exception as exc:
-        print(f"Warning: could not read presets from {path}: {exc}", file=sys.stderr)
-        return {}
+        print(f"Warning: could not read config from {path}: {exc}", file=sys.stderr)
+        return default_cfg
 
 
-def save_presets(presets: dict[str, dict[str, Any]], path: Path = DEFAULT_PRESETS_PATH) -> None:
-    path.write_text(json.dumps({"presets": presets}, indent=2) + "\n", encoding="utf-8")
+def save_config(cfg: dict[str, Any], path: Path = DEFAULT_PRESETS_PATH) -> None:
+    out = {
+        "contact": cfg.get("contact") or {
+            "first_name": None,
+            "last_name": None,
+            "email": None,
+            "phone": None,
+        },
+        "presets": cfg.get("presets") or {},
+    }
+    path.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
 
 
 def find_browser_executable(custom_path: str | None = None) -> str | None:
@@ -111,6 +140,18 @@ def select_radio_question(page: Page, data_code: str, option_value: str) -> None
     radio.click()
 
 
+def normalize_phone_digits(phone: str) -> str:
+    """Extract 10-digit US phone number for the PGH 311 phone input."""
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    if len(digits) != 10:
+        raise ValueError(
+            f"Phone number must contain 10 digits (got '{phone}'). Example: 412-555-1234"
+        )
+    return digits
+
+
 def submit_parking_report(
     address: str,
     description: str,
@@ -124,6 +165,10 @@ def submit_parking_report(
     duration: str = "N/A",
     additional_info: str | None = None,
     location_details: str | None = None,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    email: str | None = None,
+    phone: str | None = None,
     headless: bool = True,
     dry_run: bool = False,
     screenshot_path: str | None = None,
@@ -144,6 +189,11 @@ def submit_parking_report(
 
     if plate_number and has_plate == "Unsure":
         has_plate = "Yes"
+
+    # PGH 311's contact step requires Last Name whenever any contact field (email/phone/first_name) is provided
+    has_any_contact = any([first_name, last_name, email, phone])
+    effective_last_name = last_name or ("Resident" if has_any_contact else None)
+    clean_phone = normalize_phone_digits(phone) if phone else None
 
     exec_path = find_browser_executable(browser_executable)
 
@@ -282,12 +332,33 @@ def submit_parking_report(
                 enabled_continue.wait_for(state="visible", timeout=10000)
                 enabled_continue.click()
 
-                # Step 4 of 5: Contact (leave blank for anonymous report)
-                log("[5/6] Step 4 of 5: Leaving contact information blank...")
+                # Step 4 of 5: Contact
                 page.get_by_text("How can we reach you?", exact=True).first.wait_for(
                     state="visible", timeout=15000
                 )
                 wait_for_spinners_hidden(page)
+
+                if has_any_contact:
+                    log("[5/6] Step 4 of 5: Filling contact information...")
+                    if first_name:
+                        fn_inp = page.locator("c-web-primary-contact-new .firstNameClass input").first
+                        fn_inp.fill(first_name)
+                        fn_inp.blur()
+                    if effective_last_name:
+                        ln_inp = page.locator("c-web-primary-contact-new .lastNameClass input").first
+                        ln_inp.fill(effective_last_name)
+                        ln_inp.blur()
+                    if email:
+                        em_inp = page.locator("c-web-primary-contact-new .emailClass input").first
+                        em_inp.fill(email)
+                        em_inp.blur()
+                    if clean_phone:
+                        ph_inp = page.locator("c-web-primary-contact-new .phoneClass input").first
+                        ph_inp.fill(clean_phone)
+                        ph_inp.blur()
+                else:
+                    log("[5/6] Step 4 of 5: Leaving contact information blank...")
+
                 enabled_continue.wait_for(state="visible", timeout=10000)
                 enabled_continue.click()
 
@@ -303,6 +374,14 @@ def submit_parking_report(
                     "description": description,
                     "report_type": report_type,
                     "photos_uploaded": [os.path.basename(p) for p in validated_photos],
+                    "contact": {
+                        "first_name": first_name,
+                        "last_name": effective_last_name,
+                        "email": email,
+                        "phone": clean_phone,
+                    }
+                    if has_any_contact
+                    else None,
                 }
 
                 if dry_run:
@@ -594,7 +673,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
   }
   .form-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
     gap: 14px;
     margin-bottom: 14px;
   }
@@ -661,6 +740,37 @@ WEB_UI_HTML = """<!DOCTYPE html>
   <div id="presetsGrid" class="grid"></div>
 
   <div class="panel-form">
+    <h2 style="margin-bottom:6px;">Default Contact Profile (Step 4 of 5)</h2>
+    <p style="margin:0 0 14px 0;font-size:0.84rem;color:var(--muted);">
+      Leave blank to submit anonymously. If you provide an email or phone number, PGH 311 requires a Last Name (defaults to "Resident" if left blank).
+    </p>
+    <form id="contactForm">
+      <div class="form-grid">
+        <div class="field">
+          <label for="cFirstName">First Name (optional)</label>
+          <input id="cFirstName" placeholder="John" />
+        </div>
+        <div class="field">
+          <label for="cLastName">Last Name (auto-fills "Resident" if needed)</label>
+          <input id="cLastName" placeholder="Doe" />
+        </div>
+        <div class="field">
+          <label for="cEmail">Email (optional)</label>
+          <input id="cEmail" type="email" placeholder="you@example.com" />
+        </div>
+        <div class="field">
+          <label for="cPhone">Phone Number (optional, 10 digits)</label>
+          <input id="cPhone" placeholder="412-555-1234" />
+        </div>
+      </div>
+      <div style="display:flex;gap:10px;">
+        <button type="submit" class="btn-secondary">Save Default Contact Info</button>
+        <button type="button" id="clearContactBtn" class="btn-danger">Clear (Report Anonymously)</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="panel-form">
     <h2 style="margin-bottom:14px;">Save New / Update Recurring Spot Preset</h2>
     <form id="presetForm">
       <div class="form-grid">
@@ -708,6 +818,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
 
 <script>
 let presets = {};
+let contact = {};
 let isBusy = false;
 
 const photoInput = document.getElementById('photoInput');
@@ -750,10 +861,15 @@ async function readSelectedPhoto() {
   });
 }
 
-async function loadPresets() {
+async function loadState() {
   const res = await fetch('/api/presets');
   const data = await res.json();
   presets = data.presets || {};
+  contact = data.contact || {};
+  document.getElementById('cFirstName').value = contact.first_name || '';
+  document.getElementById('cLastName').value = contact.last_name || '';
+  document.getElementById('cEmail').value = contact.email || '';
+  document.getElementById('cPhone').value = contact.phone || '';
   renderPresets();
 }
 
@@ -802,7 +918,7 @@ function renderPresets() {
     card.querySelector('.delete-btn').addEventListener('click', async () => {
       if (!confirm(`Delete preset "${p.label || key}"?`)) return;
       await fetch(`/api/presets/${encodeURIComponent(key)}`, { method: 'DELETE' });
-      await loadPresets();
+      await loadState();
     });
     grid.appendChild(card);
   }
@@ -845,6 +961,7 @@ async function triggerReport(payload) {
         'success',
         `Dry-Run Complete (Stopped at Step 5 Review)`,
         `Matched Address : ${data.matched_address}\\nDescription     : ${data.description}` +
+        (data.contact ? `\\nContact         : ${[data.contact.first_name, data.contact.last_name, data.contact.email, data.contact.phone].filter(Boolean).join(' | ')}` : '\\nContact         : Anonymous') +
         (data.photos_uploaded?.length ? `\\nPhotos Uploaded : ${data.photos_uploaded.join(', ')}` : '')
       );
     }
@@ -854,6 +971,34 @@ async function triggerReport(payload) {
     setBusy(false);
   }
 }
+
+document.getElementById('contactForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const payload = {
+    first_name: document.getElementById('cFirstName').value.trim() || null,
+    last_name: document.getElementById('cLastName').value.trim() || null,
+    email: document.getElementById('cEmail').value.trim() || null,
+    phone: document.getElementById('cPhone').value.trim() || null,
+  };
+  await fetch('/api/contact', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  await loadState();
+  setStatus('success', 'Saved Default Contact Profile', JSON.stringify(payload, null, 2));
+});
+
+document.getElementById('clearContactBtn').addEventListener('click', async () => {
+  const payload = { first_name: null, last_name: null, email: null, phone: null };
+  await fetch('/api/contact', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  await loadState();
+  setStatus('success', 'Cleared Default Contact Profile (Anonymous Mode)', '');
+});
 
 document.getElementById('presetForm').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -874,7 +1019,7 @@ document.getElementById('presetForm').addEventListener('submit', async (e) => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  await loadPresets();
+  await loadState();
   setStatus('success', `Saved preset "${payload.label}" (${key})`, `CLI usage: ./report_parking.py --preset ${key}`);
 });
 
@@ -895,7 +1040,7 @@ document.getElementById('submitAdhocBtn').addEventListener('click', () => {
   });
 });
 
-loadPresets();
+loadState();
 </script>
 </body>
 </html>
@@ -936,12 +1081,25 @@ def run_web_server(
                 self.wfile.write(body)
                 return
             if parsed.path == "/api/presets":
-                self._send_json({"presets": load_presets(presets_path)})
+                self._send_json(load_config(presets_path))
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
+            if parsed.path == "/api/contact":
+                data = self._read_json()
+                cfg = load_config(presets_path)
+                cfg["contact"] = {
+                    "first_name": (data.get("first_name") or "").strip() or None,
+                    "last_name": (data.get("last_name") or "").strip() or None,
+                    "email": (data.get("email") or "").strip() or None,
+                    "phone": (data.get("phone") or "").strip() or None,
+                }
+                save_config(cfg, presets_path)
+                self._send_json({"status": "ok", "contact": cfg["contact"]})
+                return
+
             if parsed.path == "/api/presets":
                 data = self._read_json()
                 key = str(data.get("key", "")).strip()
@@ -953,7 +1111,8 @@ def run_web_server(
                         status=HTTPStatus.BAD_REQUEST,
                     )
                     return
-                presets = load_presets(presets_path)
+                full_cfg = load_config(presets_path)
+                presets = full_cfg["presets"]
                 presets[key] = {
                     "label": str(data.get("label") or key).strip(),
                     "address": address,
@@ -968,14 +1127,16 @@ def run_web_server(
                     "additional_info": data.get("additional_info") or None,
                     "location_details": data.get("location_details") or None,
                 }
-                save_presets(presets, presets_path)
+                save_config(full_cfg, presets_path)
                 self._send_json({"status": "ok", "presets": presets})
                 return
 
             if parsed.path == "/api/report":
                 data = self._read_json()
                 preset_key = data.get("preset")
-                presets = load_presets(presets_path)
+                full_cfg = load_config(presets_path)
+                presets = full_cfg["presets"]
+                contact_cfg = full_cfg["contact"]
                 if preset_key:
                     if preset_key not in presets:
                         self._send_json(
@@ -1014,6 +1175,10 @@ def run_web_server(
                         duration=cfg.get("duration") or "N/A",
                         additional_info=cfg.get("additional_info"),
                         location_details=cfg.get("location_details"),
+                        first_name=cfg.get("first_name") or contact_cfg.get("first_name"),
+                        last_name=cfg.get("last_name") or contact_cfg.get("last_name"),
+                        email=cfg.get("email") or contact_cfg.get("email"),
+                        phone=cfg.get("phone") or contact_cfg.get("phone"),
                         headless=True,
                         dry_run=bool(data.get("dry_run", False)),
                         verbose=True,
@@ -1040,10 +1205,11 @@ def run_web_server(
                 from urllib.parse import unquote
 
                 key = unquote(parsed.path[len("/api/presets/") :])
-                presets = load_presets(presets_path)
+                full_cfg = load_config(presets_path)
+                presets = full_cfg["presets"]
                 if key in presets:
                     del presets[key]
-                    save_presets(presets, presets_path)
+                    save_config(full_cfg, presets_path)
                 self._send_json({"status": "ok", "presets": presets})
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -1085,7 +1251,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--list-presets",
         action="store_true",
-        help="List all saved presets from presets.json and exit.",
+        help="List all saved presets and default contact info from presets.json and exit.",
     )
     parser.add_argument(
         "--save-preset",
@@ -1103,6 +1269,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="NAME",
         help="Delete a named preset from presets.json and exit.",
+    )
+    parser.add_argument(
+        "--save-contact",
+        action="store_true",
+        help="Save --email, --phone, --first-name, --last-name as the default contact profile in presets.json.",
+    )
+    parser.add_argument(
+        "--clear-contact",
+        action="store_true",
+        help="Clear the saved default contact profile in presets.json (revert to anonymous).",
+    )
+    parser.add_argument(
+        "--anonymous",
+        action="store_true",
+        help="Ignore any saved contact profile for this run and submit anonymously.",
+    )
+    parser.add_argument(
+        "--first-name",
+        default=None,
+        help="Step 4 Contact: First name.",
+    )
+    parser.add_argument(
+        "--last-name",
+        default=None,
+        help="Step 4 Contact: Last name (auto-fills 'Resident' if email/phone is set without last name).",
+    )
+    parser.add_argument(
+        "--email",
+        default=None,
+        help="Step 4 Contact: Email address.",
+    )
+    parser.add_argument(
+        "--phone",
+        default=None,
+        help="Step 4 Contact: 10-digit US phone number (e.g. '412-555-1234').",
     )
     parser.add_argument(
         "--presets-file",
@@ -1216,19 +1417,60 @@ def main(argv: list[str] | None = None) -> int:
         run_web_server(host=args.host, port=args.port, presets_path=presets_path)
         return 0
 
-    presets = load_presets(presets_path)
+    full_cfg = load_config(presets_path)
+    presets = full_cfg["presets"]
+    contact_cfg = full_cfg["contact"]
+
+    if args.clear_contact:
+        full_cfg["contact"] = {
+            "first_name": None,
+            "last_name": None,
+            "email": None,
+            "phone": None,
+        }
+        save_config(full_cfg, presets_path)
+        print(f"Cleared saved contact profile in {presets_path}.")
+        return 0
+
+    if args.save_contact:
+        full_cfg["contact"] = {
+            "first_name": args.first_name if args.first_name is not None else contact_cfg.get("first_name"),
+            "last_name": args.last_name if args.last_name is not None else contact_cfg.get("last_name"),
+            "email": args.email if args.email is not None else contact_cfg.get("email"),
+            "phone": args.phone if args.phone is not None else contact_cfg.get("phone"),
+        }
+        save_config(full_cfg, presets_path)
+        contact_cfg = full_cfg["contact"]
+        print(f"Saved default contact profile to {presets_path}:")
+        print(f"  First Name : {contact_cfg.get('first_name') or '(none)'}")
+        print(f"  Last Name  : {contact_cfg.get('last_name') or '(auto: Resident)'}")
+        print(f"  Email      : {contact_cfg.get('email') or '(none)'}")
+        print(f"  Phone      : {contact_cfg.get('phone') or '(none)'}")
+        if not args.preset and not args.address:
+            return 0
 
     if args.list_presets:
         if args.json:
-            print(json.dumps({"presets": presets}, indent=2))
-        elif not presets:
-            print("No presets saved.")
+            print(json.dumps(full_cfg, indent=2))
         else:
-            print(f"Saved Presets ({presets_path}):")
-            for k, v in presets.items():
-                label = v.get("label") or k
-                print(f"  {k:<18} | {label} — {v.get('address')}")
-                print(f"  {'':<18}   \"{v.get('description')}\"")
+            has_contact = any(contact_cfg.values())
+            print(f"Default Contact ({presets_path}):")
+            if has_contact:
+                print(
+                    f"  Name: {contact_cfg.get('first_name') or ''} {contact_cfg.get('last_name') or '(auto: Resident)'}".strip()
+                )
+                print(f"  Email: {contact_cfg.get('email') or '(none)'} | Phone: {contact_cfg.get('phone') or '(none)'}")
+            else:
+                print("  Anonymous (all contact fields blank)")
+            print()
+            if not presets:
+                print("No presets saved.")
+            else:
+                print("Saved Spot Presets:")
+                for k, v in presets.items():
+                    label = v.get("label") or k
+                    print(f"  {k:<18} | {label} — {v.get('address')}")
+                    print(f"  {'':<18}   \"{v.get('description')}\"")
         return 0
 
     if args.delete_preset:
@@ -1236,7 +1478,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: Preset '{args.delete_preset}' not found.", file=sys.stderr)
             return 1
         del presets[args.delete_preset]
-        save_presets(presets, presets_path)
+        save_config(full_cfg, presets_path)
         print(f"Deleted preset '{args.delete_preset}'.")
         return 0
 
@@ -1272,6 +1514,14 @@ def main(argv: list[str] | None = None) -> int:
         else preset_cfg.get("location_details")
     )
 
+    if args.anonymous:
+        first_name = last_name = email = phone = None
+    else:
+        first_name = args.first_name or preset_cfg.get("first_name") or contact_cfg.get("first_name")
+        last_name = args.last_name or preset_cfg.get("last_name") or contact_cfg.get("last_name")
+        email = args.email or preset_cfg.get("email") or contact_cfg.get("email")
+        phone = args.phone or preset_cfg.get("phone") or contact_cfg.get("phone")
+
     if args.save_preset:
         if not address or not description:
             print(
@@ -1293,7 +1543,7 @@ def main(argv: list[str] | None = None) -> int:
             "additional_info": additional_info,
             "location_details": location_details,
         }
-        save_presets(presets, presets_path)
+        save_config(full_cfg, presets_path)
         print(f"Saved preset '{args.save_preset}' to {presets_path}.")
         if not args.preset and not args.dry_run:
             return 0
@@ -1319,6 +1569,10 @@ def main(argv: list[str] | None = None) -> int:
             duration=duration,
             additional_info=additional_info,
             location_details=location_details,
+            first_name=first_name,
+            last_name=last_name,
+            email=email,
+            phone=phone,
             headless=not args.headed,
             dry_run=args.dry_run,
             screenshot_path=args.screenshot,
@@ -1346,6 +1600,12 @@ def main(argv: list[str] | None = None) -> int:
             print("Dry Run Complete (Stopped at Step 5 of 5: Review)")
             print(f"  Matched Address : {res['matched_address']}")
             print(f"  Description     : {res['description']}")
+            if res.get("contact"):
+                c = res["contact"]
+                print(
+                    f"  Contact         : {' '.join(filter(None, [c.get('first_name'), c.get('last_name')]))} | "
+                    f"Email: {c.get('email') or 'none'} | Phone: {c.get('phone') or 'none'}"
+                )
             if res.get("photos_uploaded"):
                 print(f"  Photos Uploaded : {', '.join(res['photos_uploaded'])}")
             if res.get("screenshot"):

@@ -61,20 +61,27 @@ Then open **http://127.0.0.1:8311** in your browser:
 ./report_parking.py "414 Grant St" "Vehicle blocking the sidewalk" --dry-run --json
 ```
 
-### Managing Presets from the CLI
+### Managing Presets & Default Contact Info from the CLI
 
-Presets are stored in [`presets.json`](./presets.json).
+Presets and your optional default contact profile (Step 4 of 5) are stored in [`presets.json`](./presets.json).
+*(Note: On PGH 311, if you provide an email or phone number, a Last Name is required by the form—if you don't specify `--last-name`, the script automatically fills `"Resident"`).*
 
 ```bash
-# List saved presets
+# List saved presets and default contact profile
 ./report_parking.py --list-presets
 
-# Save a new preset
+# Save your default email / phone (used automatically for all reports)
+./report_parking.py --save-contact --email "you@example.com" --phone "412-555-1234" --first-name "Jane" --last-name "Doe"
+
+# Clear saved contact info (revert to anonymous reporting)
+./report_parking.py --clear-contact
+
+# Save a new spot preset
 ./report_parking.py "900 Penn Ave" "Vehicles parked in the protected bike lane" \
   --save-preset penn-bikelane \
   --preset-label "Penn Ave Bike Lane"
 
-# Delete a preset
+# Delete a spot preset
 ./report_parking.py --delete-preset penn-bikelane
 ```
 
@@ -88,10 +95,17 @@ positional arguments:
 options:
   -h, --help            Show help message and exit.
   -P, --preset PRESET   Submit using a saved preset name from presets.json.
-  --list-presets        List all saved presets from presets.json and exit.
+  --list-presets        List all saved presets and default contact info from presets.json and exit.
   --save-preset NAME    Save the provided address/description/options as a named preset in presets.json.
   --preset-label LABEL  Optional human-readable display label when using --save-preset.
   --delete-preset NAME  Delete a named preset from presets.json and exit.
+  --save-contact        Save --email, --phone, --first-name, --last-name as the default contact profile in presets.json.
+  --clear-contact       Clear the saved default contact profile in presets.json (revert to anonymous).
+  --anonymous           Ignore any saved contact profile for this run and submit anonymously.
+  --first-name NAME     Step 4 Contact: First name.
+  --last-name NAME      Step 4 Contact: Last name (auto-fills 'Resident' if email/phone is set without last name).
+  --email EMAIL         Step 4 Contact: Email address.
+  --phone PHONE         Step 4 Contact: 10-digit US phone number (e.g. '412-555-1234').
   --presets-file PATH   Path to presets JSON file (default: ./presets.json).
   --serve               Start the local one-click Web UI server.
   --port PORT           Port for --serve Web UI (default: 8311).
