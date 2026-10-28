@@ -1,6 +1,6 @@
 # pgh-311-parking
 
-Automated CLI and local one-click Web UI for reporting illegal parking to [Pittsburgh 311](https://pittsburghpa.my.site.com/311/s/).
+Tired of filling in the 311 form and clicking through the same steps every time? This tool automates the process with a CLI and local one-click Web UI for reporting illegal parking to [Pittsburgh 311](https://pittsburghpa.my.site.com/311/s/). Designed to allow you to save preset addresses, contact information, and other default values for form fields, so that you can report recurring illegal parking at known locations with one click.
 
 ## Features
 
